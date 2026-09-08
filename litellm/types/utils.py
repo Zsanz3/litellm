@@ -3779,6 +3779,8 @@ all_litellm_params = (
         "merge_reasoning_content_in_choices",
         "litellm_credential_name",
         "allowed_openai_params",
+        "drop_params",
+        "additional_drop_params",
         "litellm_session_id",
         "use_litellm_proxy",
         "use_chat_completions_api",
