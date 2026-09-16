@@ -14,7 +14,7 @@ import copy
 import json
 import math
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -61,6 +61,7 @@ from litellm.proxy._types import (
     SpecialProxyStrings,
     TeamAccessGroupModelGrant,
     TeamAddMemberResponse,
+    TeamInfoMember,
     TeamInfoResponseObject,
     TeamInfoResponseObjectTeamTable,
     TeamListResponseObject,
@@ -1526,12 +1527,12 @@ async def new_team(
                     value=getattr(data, field),
                 )
 
-        # If budget_duration is set, set `budget_reset_at`
-        if complete_team_data.budget_duration is not None:
+        usable_budget_duration: Final = _usable_budget_duration(complete_team_data.budget_duration)
+        if usable_budget_duration is not None:
             from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
 
             complete_team_data.budget_reset_at = get_budget_reset_time(
-                budget_duration=complete_team_data.budget_duration,
+                budget_duration=usable_budget_duration,
             )
 
         # If budget_limits is set, initialize reset_at for each window
@@ -1551,7 +1552,11 @@ async def new_team(
             members_with_roles = complete_team_data.members_with_roles
             complete_team_data.members_with_roles = []
 
-        complete_team_data_dict = complete_team_data.model_dump(exclude_none=True)
+        dumped_team_data: Final = complete_team_data.model_dump(exclude_none=True)
+        complete_team_data_dict = _persistence_values_for_budget_duration(
+            dumped_team_data,
+            complete_team_data.budget_duration,
+        )
 
         # Serialize router_settings to JSON (matching key creation pattern)
         router_settings_value: Final = getattr(data, "router_settings", None)
@@ -1902,6 +1907,39 @@ def validate_team_org_change(
     return True
 
 
+def _member_user_ids(members_with_roles: Sequence[dict[str, object]]) -> tuple[str, ...]:
+    """Extract the string ``user_id`` of each team member, dropping rows without one.
+
+    ``members_with_roles`` is a Prisma-deserialized JSON column, so its ``user_id`` is typed
+    ``object``; the ``isinstance`` narrows it to the ``str`` ``invalidate_team_member_spend_state`` needs.
+    """
+    return tuple(user_id for member in members_with_roles if isinstance((user_id := member.get("user_id")), str))
+
+
+async def _evict_created_membership_caches(
+    user_ids: Iterable[str],
+    team_id: str,
+    user_api_key_cache: UserApiKeyCache,
+) -> None:
+    """Evict the ``get_team_membership`` negative-cache sentinel for members whose row was just created.
+
+    A session-token request caches ``NO_TEAM_MEMBERSHIP_SENTINEL`` for a member with no
+    ``LiteLLM_TeamMembership`` row. When a create path (``/team/member_add`` or the ``/team/update``
+    budget backfill) later writes that row with a per-member budget, the stale sentinel keeps the
+    member's budget unenforced until the membership cache TTL expires, so it must be evicted here.
+    """
+    await asyncio.gather(
+        *(
+            invalidate_team_member_spend_state(
+                user_id=user_id,
+                team_id=team_id,
+                user_api_key_cache=user_api_key_cache,
+            )
+            for user_id in user_ids
+        )
+    )
+
+
 @router.post("/team/update", tags=["team management"], dependencies=[Depends(user_api_key_auth)])
 @management_endpoint_wrapper
 async def update_team(
@@ -2179,7 +2217,7 @@ async def update_team(
             )
 
         # Check budget_duration and budget_reset_at
-        _set_budget_reset_at(data, updated_kv)
+        updated_kv = _set_budget_reset_at(data, updated_kv)
 
         _team_member_fields_in_request: Final = {
             field
@@ -2199,12 +2237,13 @@ async def update_team(
                 *LiteLLM_ManagementEndpoint_MetadataFields_Premium,
             )
         )
+        incoming_metadata: Final = updated_kv.get("metadata")
         if isinstance(existing_team_row.metadata, dict):
             if "metadata" not in updated_kv and (_team_member_fields_in_request or _writes_metadata_backed_field):
                 updated_kv["metadata"] = copy.deepcopy(existing_team_row.metadata)
-            elif isinstance(updated_kv.get("metadata"), dict):
+            elif isinstance(incoming_metadata, dict):
                 updated_kv["metadata"] = {
-                    **updated_kv["metadata"],
+                    **incoming_metadata,
                     **{
                         key: existing_team_row.metadata[key]
                         for key in TeamMemberBudgetHandler.SYSTEM_MANAGED_METADATA_KEYS
@@ -2237,6 +2276,11 @@ async def update_team(
                     members_with_roles=existing_team_row.members_with_roles,
                     team_member_budget_id=_backfill_budget_id,
                     prisma_client=prisma_client,
+                )
+                await _evict_created_membership_caches(
+                    user_ids=_member_user_ids(existing_team_row.members_with_roles),
+                    team_id=data.team_id,
+                    user_api_key_cache=user_api_key_cache,
                 )
         elif _team_member_fields_in_request:
             updated_kv = await TeamMemberBudgetHandler.clear_team_member_budget_fields(
@@ -2403,25 +2447,46 @@ async def patch_team(
         raise handle_exception_on_proxy(e)
 
 
-def _set_budget_reset_at(data: UpdateTeamRequest, updated_kv: dict) -> None:
-    """Set budget_reset_at in updated_kv if budget_duration is provided."""
-    if data.budget_duration is not None:
+def _usable_budget_duration(duration: str | None) -> str | None:
+    if duration is None or duration.strip() == "":
+        return None
+    return duration
+
+
+def _persistence_values_for_budget_duration(
+    persistence_values: Mapping[str, object],
+    duration: str | None,
+) -> dict[str, object]:
+    if _usable_budget_duration(duration) is not None:
+        return {**persistence_values}
+    return {key: value for key, value in persistence_values.items() if key != "budget_duration"}
+
+
+def _budget_reset_persistence_fields(data: UpdateTeamRequest, updated_kv: Mapping[str, object]) -> Mapping[str, object]:
+    usable_budget_duration: Final = _usable_budget_duration(data.budget_duration)
+    if usable_budget_duration is not None:
         from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
 
-        reset_at: Final = get_budget_reset_time(budget_duration=data.budget_duration)
-        updated_kv["budget_reset_at"] = reset_at
-    elif "budget_duration" in updated_kv and updated_kv["budget_duration"] is None:
-        updated_kv["budget_reset_at"] = None
+        return MappingProxyType({"budget_reset_at": get_budget_reset_time(budget_duration=usable_budget_duration)})
+    if data.budget_duration is not None or ("budget_duration" in updated_kv and updated_kv["budget_duration"] is None):
+        return MappingProxyType({"budget_duration": None, "budget_reset_at": None})
+    return MappingProxyType({})
 
-    if data.budget_limits is not None and len(data.budget_limits) > 0:
-        from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
 
-        initialized_windows: Final = []
-        for window in data.budget_limits:
-            w = window if isinstance(window, dict) else window.model_dump()
-            w["reset_at"] = get_budget_reset_time(budget_duration=w["budget_duration"]).isoformat()
-            initialized_windows.append(w)
-        updated_kv["budget_limits"] = json.dumps(initialized_windows)
+def _set_budget_reset_at(data: UpdateTeamRequest, updated_kv: Mapping[str, object]) -> dict[str, object]:
+    """Return a persistence copy with budget_reset_at. Does not mutate `updated_kv`."""
+    budget_fields: Final = _budget_reset_persistence_fields(data, updated_kv)
+    if data.budget_limits is None or len(data.budget_limits) == 0:
+        return {**updated_kv, **budget_fields}
+
+    from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
+
+    initialized_windows: Final = []
+    for window in data.budget_limits:
+        w = window if isinstance(window, dict) else window.model_dump()
+        w["reset_at"] = get_budget_reset_time(budget_duration=w["budget_duration"]).isoformat()
+        initialized_windows.append(w)
+    return {**updated_kv, **budget_fields, "budget_limits": json.dumps(initialized_windows)}
 
 
 async def handle_update_object_permission(data_json: dict, existing_team_row: _ObjectPermissionRow) -> dict:
@@ -3188,6 +3253,12 @@ async def team_member_add(
         prisma_client=prisma_client,
         user_api_key_dict=user_api_key_dict,
         litellm_proxy_admin_name=litellm_proxy_admin_name,
+    )
+
+    await _evict_created_membership_caches(
+        user_ids=(tm.user_id for tm in updated_team_memberships),
+        team_id=data.team_id,
+        user_api_key_cache=user_api_key_cache,
     )
 
     _emit_team_members_metric(complete_team_data)
@@ -4292,37 +4363,35 @@ async def _add_team_member_budget_table(
     return team_info_response_object
 
 
-async def _hydrate_member_emails(
+async def _hydrate_member_user_details(
     prisma_client: PrismaClient,
     members: Sequence[Member],
-) -> tuple[Member, ...]:
-    """Fill in ``user_email`` for roster entries that were stored without one.
-
-    ``members_with_roles`` is a denormalized snapshot written at add-time, so an entry
-    stored with ``user_email=None`` keeps that null even once the user row has an email.
-    Look the missing ones up in ``LiteLLM_UserTable`` (one indexed query) and fill them
-    in. A stored email is never overwritten - the snapshot stays the source of truth
-    wherever it has a value.
-    """
-    missing_user_ids: Final = frozenset(m.user_id for m in members if not m.user_email and m.user_id is not None)
-    if not missing_user_ids:
-        return tuple(members)
-
-    user_rows: Final[Sequence[prisma_models.LiteLLM_UserTable]] = await _user_db(prisma_client).find_many(
-        where={  # mutable-ok: Prisma query filters are dict-shaped
-            "user_id": {  # mutable-ok: Prisma query filters are dict-shaped
-                "in": sorted(missing_user_ids)
+) -> tuple[TeamInfoMember, ...]:
+    """Attach ``user_alias`` and fill in a missing ``user_email`` from ``LiteLLM_UserTable`` in one query."""
+    user_ids: Final = frozenset(m.user_id for m in members if m.user_id is not None)
+    user_rows: Final[Sequence[prisma_models.LiteLLM_UserTable]] = (
+        await _user_db(prisma_client).find_many(
+            where={  # mutable-ok: Prisma query filters are dict-shaped
+                "user_id": {  # mutable-ok: Prisma query filters are dict-shaped
+                    "in": sorted(user_ids)
+                }
             }
-        }
+        )
+        if user_ids
+        else ()
     )
-    email_by_user_id: Final = MappingProxyType({u.user_id: u.user_email for u in user_rows if u.user_email})
+    user_by_id: Final = MappingProxyType({u.user_id: u for u in user_rows})
 
-    return tuple(
-        m.model_copy(update={"user_email": email_by_user_id[m.user_id]})  # mutable-ok: pydantic update payload
-        if not m.user_email and m.user_id is not None and m.user_id in email_by_user_id
-        else m
-        for m in members
-    )
+    def hydrate(m: Member) -> TeamInfoMember:
+        user_row: Final = user_by_id.get(m.user_id) if m.user_id is not None else None
+        return TeamInfoMember(
+            role=m.role,
+            user_id=m.user_id,
+            user_email=m.user_email or (user_row.user_email if user_row is not None else None),
+            user_alias=user_row.user_alias if user_row is not None else None,
+        )
+
+    return tuple(hydrate(m) for m in members)
 
 
 async def _resolve_team_access_group_resources(
@@ -4462,17 +4531,12 @@ async def team_info(
         # Resolve resources inherited from access groups
         resolved_team_info: Final = await _resolve_team_access_group_resources(_team_info)
 
-        # Fill in emails the add-time roster snapshot never captured
-        hydrated_members: Final = await _hydrate_member_emails(
+        hydrated_members: Final = await _hydrate_member_user_details(
             prisma_client=prisma_client,
             members=resolved_team_info.members_with_roles,
         )
         hydrated_team_info: Final = resolved_team_info.model_copy(
-            update={  # mutable-ok: pydantic update payload
-                # list(), not the tuple: model_copy skips validation, so the field has
-                # to be handed the list[Member] the response model declares.
-                "members_with_roles": list(hydrated_members)  # mutable-ok: declared list[Member]
-            }
+            update={"members_with_roles": hydrated_members}  # mutable-ok: pydantic update payload
         )
 
         response_object: Final = TeamInfoResponseObject(

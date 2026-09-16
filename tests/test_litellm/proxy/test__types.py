@@ -5,14 +5,18 @@ from pydantic import ValidationError
 
 from litellm.proxy._types import (
     ROLES_WITHIN_ORG,
+    ChangePasswordRequest,
     GenerateKeyRequest,
     KeyRequest,
     LiteLLM_AuditLogs,
     LiteLLM_TeamMembership,
     LitellmUserRoles,
+    NewTeamRequest,
+    NewUserRequest,
     OrganizationMemberUpdateRequest,
     ResetSpendRequest,
     UpdateKeyRequest,
+    UpdateTeamRequest,
     UpdateUserRequest,
     UserAPIKeyAuth,
 )
@@ -188,6 +192,15 @@ def test_an_empty_max_budget_from_a_form_post_reads_as_no_budget_not_as_zero():
     assert GenerateKeyRequest(max_budget="").max_budget is None
 
 
+@pytest.mark.parametrize("blank", ("", "   "))
+def test_an_empty_budget_duration_from_a_form_post_reads_as_unset(blank):
+    assert GenerateKeyRequest(budget_duration=blank).budget_duration is None
+    assert NewTeamRequest(team_alias="my-team", budget_duration=blank).budget_duration is None
+    assert NewTeamRequest(team_alias="my-team", team_member_budget_duration=blank).team_member_budget_duration is None
+    assert UpdateTeamRequest(team_id="team-1", budget_duration=blank).budget_duration is None
+    assert UpdateTeamRequest(team_id="team-1", team_member_budget_duration=blank).team_member_budget_duration is None
+
+
 @pytest.mark.parametrize("sent", (0, 0.0, 25.5))
 def test_a_max_budget_that_was_actually_sent_is_kept(sent):
     assert GenerateKeyRequest(max_budget=sent).max_budget == sent
@@ -277,3 +290,43 @@ def test_team_membership_budget_table_present_still_works():
     }
     result = LiteLLM_TeamMembership.model_validate(data)
     assert result.litellm_budget_table is None
+
+
+def test_new_user_request_loudly_rejects_a_password():
+    """
+    /user/new has never persisted a password (the field used to be silently
+    dropped). Sending one must now fail visibly so the dead path cannot be
+    revived without going through the password policy.
+    """
+    with pytest.raises(ValidationError, match="invitation link"):
+        NewUserRequest(user_email="alice@example.com", password="hunter2hunter2")
+
+
+def test_new_user_request_without_password_still_works():
+    request = NewUserRequest(user_email="alice@example.com")
+    assert request.password is None
+
+
+def test_update_user_request_accepts_a_password():
+    """Admins set user passwords through /user/update; the value must survive
+    model validation so the endpoint can policy-check and hash it."""
+    request = UpdateUserRequest(user_id="user-123", password="hunter2hunter2")
+    assert request.password == "hunter2hunter2"
+
+
+def test_update_user_request_password_hidden_from_repr():
+    """management_endpoint_wrapper string-formats endpoint kwargs into Slack
+    alerts, so the model's repr/str must never contain the plaintext password."""
+    request = UpdateUserRequest(user_id="user-123", password="hunter2hunter2")
+    assert "hunter2hunter2" not in repr(request)
+    assert "hunter2hunter2" not in str(request)
+
+
+def test_change_password_request_passwords_hidden_from_repr():
+    """Any accidental str()/repr() of the request model (debug logs, exception
+    handlers, a future management_endpoint_wrapper) must never contain either
+    plaintext password."""
+    request = ChangePasswordRequest(current_password="hunter2hunter2", new_password="NewP@ssw0rd-2026")
+    for rendered in (repr(request), str(request)):
+        assert "hunter2hunter2" not in rendered
+        assert "NewP@ssw0rd-2026" not in rendered

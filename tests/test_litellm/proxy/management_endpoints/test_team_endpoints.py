@@ -541,6 +541,50 @@ async def test_update_team_rejects_a_duration_that_never_advances(
     mock_find_unique.assert_not_awaited()
 
 
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_set_budget_reset_at_treats_a_blank_duration_as_unset(blank):
+    from litellm.proxy.management_endpoints.team_endpoints import _set_budget_reset_at
+
+    data = UpdateTeamRequest.model_construct(team_id="team-1", budget_duration=blank)
+    updated_kv = {"budget_duration": blank}
+
+    persisted = _set_budget_reset_at(data, updated_kv)
+
+    assert persisted["budget_duration"] is None
+    assert persisted["budget_reset_at"] is None
+    assert updated_kv == {"budget_duration": blank}
+    assert data.budget_duration == blank
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_create_persistence_drops_blank_budget_duration_without_mutating_input(blank):
+    from litellm.proxy.management_endpoints.team_endpoints import (
+        _persistence_values_for_budget_duration,
+    )
+
+    dumped = {"team_alias": "blank-duration-team", "budget_duration": blank, "max_budget": 10}
+
+    persisted = _persistence_values_for_budget_duration(dumped, blank)
+
+    assert "budget_duration" not in persisted
+    assert persisted["team_alias"] == "blank-duration-team"
+    assert dumped == {"team_alias": "blank-duration-team", "budget_duration": blank, "max_budget": 10}
+
+
+def test_create_persistence_keeps_a_usable_budget_duration_without_mutating_input():
+    from litellm.proxy.management_endpoints.team_endpoints import (
+        _persistence_values_for_budget_duration,
+    )
+
+    dumped = {"team_alias": "daily-team", "budget_duration": "1d"}
+
+    persisted = _persistence_values_for_budget_duration(dumped, "1d")
+
+    assert persisted["budget_duration"] == "1d"
+    assert persisted is not dumped
+    assert dumped == {"team_alias": "daily-team", "budget_duration": "1d"}
+
+
 @pytest.mark.asyncio
 async def test_new_team_with_object_permission(mock_db_client, mock_admin_auth):
     """
@@ -10821,7 +10865,7 @@ async def test_update_team_blocks_non_admin_passthrough_routes(mock_db_client):
 def test_set_budget_reset_at_clears_when_budget_duration_null():
     """
     When budget_duration is explicitly set to null, _set_budget_reset_at
-    should set budget_reset_at=None in updated_kv so Prisma clears it in the DB.
+    should set budget_reset_at=None in the persistence copy so Prisma clears it.
     """
     from litellm.proxy._types import UpdateTeamRequest
     from litellm.proxy.management_endpoints.team_endpoints import _set_budget_reset_at
@@ -10829,16 +10873,17 @@ def test_set_budget_reset_at_clears_when_budget_duration_null():
     data = UpdateTeamRequest(team_id="test-team", budget_duration=None)
     updated_kv = {"team_id": "test-team", "budget_duration": None}
 
-    _set_budget_reset_at(data, updated_kv)
+    persisted = _set_budget_reset_at(data, updated_kv)
 
-    assert "budget_reset_at" in updated_kv
-    assert updated_kv["budget_reset_at"] is None
+    assert persisted["budget_reset_at"] is None
+    assert persisted["budget_duration"] is None
+    assert updated_kv == {"team_id": "test-team", "budget_duration": None}
 
 
 def test_set_budget_reset_at_noop_when_budget_duration_not_sent():
     """
     When budget_duration is NOT sent (unset), _set_budget_reset_at should
-    not add budget_reset_at to updated_kv.
+    not add budget_reset_at to the persistence copy.
     """
     from litellm.proxy._types import UpdateTeamRequest
     from litellm.proxy.management_endpoints.team_endpoints import _set_budget_reset_at
@@ -10846,15 +10891,17 @@ def test_set_budget_reset_at_noop_when_budget_duration_not_sent():
     data = UpdateTeamRequest(team_id="test-team")
     updated_kv = {"team_id": "test-team"}
 
-    _set_budget_reset_at(data, updated_kv)
+    persisted = _set_budget_reset_at(data, updated_kv)
 
-    assert "budget_reset_at" not in updated_kv
+    assert "budget_reset_at" not in persisted
+    assert persisted == {"team_id": "test-team"}
+    assert updated_kv == {"team_id": "test-team"}
 
 
 def test_set_budget_reset_at_sets_value_when_budget_duration_provided():
     """
     When budget_duration is set to a valid string, _set_budget_reset_at
-    should compute and set budget_reset_at.
+    should compute and set budget_reset_at on the persistence copy.
     """
     from litellm.proxy._types import UpdateTeamRequest
     from litellm.proxy.management_endpoints.team_endpoints import _set_budget_reset_at
@@ -10862,10 +10909,11 @@ def test_set_budget_reset_at_sets_value_when_budget_duration_provided():
     data = UpdateTeamRequest(team_id="test-team", budget_duration="30d")
     updated_kv = {"team_id": "test-team", "budget_duration": "30d"}
 
-    _set_budget_reset_at(data, updated_kv)
+    persisted = _set_budget_reset_at(data, updated_kv)
 
-    assert "budget_reset_at" in updated_kv
-    assert updated_kv["budget_reset_at"] is not None
+    assert persisted["budget_reset_at"] is not None
+    assert persisted["budget_duration"] == "30d"
+    assert updated_kv == {"team_id": "test-team", "budget_duration": "30d"}
 
 
 @pytest.mark.asyncio
@@ -11220,13 +11268,14 @@ async def test_team_info_returns_model_aliases():
 
 
 @pytest.mark.asyncio
-async def test_team_info_hydrates_member_emails_from_the_user_table():
-    """/team/info must fill in emails missing from the members_with_roles snapshot.
+async def test_team_info_hydrates_member_names_and_emails_from_the_user_table():
+    """/team/info must attach each member's display name and fill in emails missing
+    from the members_with_roles snapshot.
 
-    members_with_roles is written at add-time, so a member added by user_id alone
-    carries user_email=None forever. Without this join the Admin UI's member table
-    shows "-" for a user that has an email on their user row. A stored email is left
-    exactly as-is.
+    members_with_roles is written at add-time, so it never carries user_alias and a
+    member added by user_id alone carries user_email=None forever. Without this join
+    the Admin UI's member table can only show emails. A stored email is left exactly
+    as-is.
     """
     from fastapi import Request
 
@@ -11246,13 +11295,8 @@ async def test_team_info_hydrates_member_emails_from_the_user_table():
 
     find_many = AsyncMock(
         return_value=[
-            LiteLLM_UserTable(
-                user_id="no-email-on-roster",
-                user_email="real@example.com",
-                max_budget=None,
-                spend=0.0,
-                models=[],
-            )
+            _user_row("no-email-on-roster", "real@example.com", "Real Person"),
+            _user_row("already-stored", "current@example.com", "Stored Person"),
         ]
     )
 
@@ -11270,12 +11314,12 @@ async def test_team_info_hydrates_member_emails_from_the_user_table():
         )
 
     members = response["team_info"].members_with_roles
-    assert [(m.user_id, m.user_email) for m in members] == [
-        ("no-email-on-roster", "real@example.com"),
-        ("already-stored", "stored@example.com"),
+    assert [(m.user_id, m.user_email, m.user_alias) for m in members] == [
+        ("no-email-on-roster", "real@example.com", "Real Person"),
+        ("already-stored", "stored@example.com", "Stored Person"),
     ]
-    # only the member actually missing an email is looked up
-    assert find_many.await_args.kwargs["where"] == {"user_id": {"in": ["no-email-on-roster"]}}
+    find_many.assert_awaited_once()
+    assert find_many.await_args.kwargs["where"] == {"user_id": {"in": ["already-stored", "no-email-on-roster"]}}
 
 
 @pytest.mark.asyncio
@@ -12472,89 +12516,93 @@ async def test_resolve_existing_member_user_ids_skips_the_query_when_no_user_ids
     repo.return_value.table.find_many.assert_not_awaited()
 
 
-def _user_row(user_id: str, user_email: str | None) -> LiteLLM_UserTable:
+def _user_row(user_id: str, user_email: str | None, user_alias: str | None = None) -> LiteLLM_UserTable:
     return LiteLLM_UserTable(
-        user_id=user_id, user_email=user_email, max_budget=None, spend=0.0, models=[]
+        user_id=user_id, user_email=user_email, user_alias=user_alias, max_budget=None, spend=0.0, models=[]
     )
 
 
 @pytest.mark.asyncio
-async def test_hydrate_member_emails_fills_in_emails_the_roster_snapshot_never_captured():
-    """A member added by user_id alone has user_email=None on the stored roster entry.
-
-    /team/info has to fill it in from the user row, or the UI renders "-" for a user
-    that plainly has an email.
+async def test_hydrate_member_user_details_attaches_alias_and_fills_in_missing_email():
+    """The stored roster never carries a display name, and a member added by user_id
+    alone has user_email=None. /team/info has to fill both in from the user row so the
+    UI can show and search by a human-readable name instead of only an email.
     """
-    from litellm.proxy.management_endpoints.team_endpoints import _hydrate_member_emails
+    from litellm.proxy.management_endpoints.team_endpoints import _hydrate_member_user_details
 
-    find_many = AsyncMock(return_value=[_user_row("by-id", "found@example.com")])
+    find_many = AsyncMock(return_value=[_user_row("by-id", "found@example.com", "Found Person")])
 
     with patch("litellm.proxy.management_endpoints.team_endpoints.UserRepository") as repo:
         repo.return_value.table.find_many = find_many
 
-        hydrated = await _hydrate_member_emails(
+        hydrated = await _hydrate_member_user_details(
             prisma_client=MagicMock(),
             members=[Member(user_id="by-id", role="admin")],
         )
 
-    assert [(m.user_id, m.user_email, m.role) for m in hydrated] == [("by-id", "found@example.com", "admin")]
+    assert [(m.user_id, m.user_email, m.user_alias, m.role) for m in hydrated] == [
+        ("by-id", "found@example.com", "Found Person", "admin")
+    ]
     find_many.assert_awaited_once()
     assert find_many.await_args.kwargs["where"] == {"user_id": {"in": ["by-id"]}}
 
 
 @pytest.mark.asyncio
-async def test_hydrate_member_emails_never_overwrites_a_stored_email():
-    """The snapshot wins wherever it has a value - hydration only fills blanks.
-
-    Overwriting would be a real behavior change to /team/info; filling a null is not.
-    """
-    from litellm.proxy.management_endpoints.team_endpoints import _hydrate_member_emails
-
-    find_many = AsyncMock(return_value=[_user_row("has-email", "current@example.com")])
+async def test_hydrate_member_user_details_never_overwrites_a_stored_email():
+    """The snapshot wins wherever it has a value - hydration only fills blanks."""
+    from litellm.proxy.management_endpoints.team_endpoints import _hydrate_member_user_details
 
     with patch("litellm.proxy.management_endpoints.team_endpoints.UserRepository") as repo:
-        repo.return_value.table.find_many = find_many
+        repo.return_value.table.find_many = AsyncMock(
+            return_value=[_user_row("has-email", "current@example.com", "Current Name")]
+        )
 
-        hydrated = await _hydrate_member_emails(
+        hydrated = await _hydrate_member_user_details(
             prisma_client=MagicMock(),
             members=[Member(user_id="has-email", user_email="stored@example.com", role="user")],
         )
 
-    assert hydrated[0].user_email == "stored@example.com"
-    # nothing was missing, so no round-trip either
-    find_many.assert_not_awaited()
+    assert (hydrated[0].user_email, hydrated[0].user_alias) == ("stored@example.com", "Current Name")
 
 
 @pytest.mark.asyncio
-async def test_hydrate_member_emails_leaves_members_alone_when_the_user_row_has_no_email():
-    """A user row with no email leaves the member as-is rather than inventing one."""
-    from litellm.proxy.management_endpoints.team_endpoints import _hydrate_member_emails
+async def test_hydrate_member_user_details_leaves_blanks_when_the_user_row_is_bare_or_missing():
+    """A user row with no email or alias, or no user row at all, must not invent values."""
+    from litellm.proxy.management_endpoints.team_endpoints import _hydrate_member_user_details
 
     with patch("litellm.proxy.management_endpoints.team_endpoints.UserRepository") as repo:
-        repo.return_value.table.find_many = AsyncMock(return_value=[_user_row("no-email", None)])
+        repo.return_value.table.find_many = AsyncMock(return_value=[_user_row("bare", None)])
 
-        hydrated = await _hydrate_member_emails(
+        hydrated = await _hydrate_member_user_details(
             prisma_client=MagicMock(),
-            members=[Member(user_id="no-email", role="user"), Member(user_email="e@example.com", role="user")],
+            members=[
+                Member(user_id="bare", role="user"),
+                Member(user_id="deleted", user_email="gone@example.com", role="user"),
+                Member(user_email="e@example.com", role="user"),
+            ],
         )
 
-    assert [m.user_email for m in hydrated] == [None, "e@example.com"]
+    assert [(m.user_id, m.user_email, m.user_alias) for m in hydrated] == [
+        ("bare", None, None),
+        ("deleted", "gone@example.com", None),
+        (None, "e@example.com", None),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_hydrate_member_emails_skips_the_query_when_every_member_has_one():
-    """No blanks means /team/info pays for no extra query."""
-    from litellm.proxy.management_endpoints.team_endpoints import _hydrate_member_emails
+async def test_hydrate_member_user_details_skips_the_query_when_no_member_has_a_user_id():
+    """Email-only roster entries give nothing to look up, so /team/info pays for no query."""
+    from litellm.proxy.management_endpoints.team_endpoints import _hydrate_member_user_details
 
     with patch("litellm.proxy.management_endpoints.team_endpoints.UserRepository") as repo:
         repo.return_value.table.find_many = AsyncMock()
 
-        hydrated = await _hydrate_member_emails(
+        hydrated = await _hydrate_member_user_details(
             prisma_client=MagicMock(),
-            members=[Member(user_id="a", user_email="a@example.com", role="user")],
+            members=[Member(user_email="a@example.com", role="user")],
         )
 
-    assert hydrated[0].user_email == "a@example.com"
+    assert [(m.user_email, m.user_alias) for m in hydrated] == [("a@example.com", None)]
     repo.return_value.table.find_many.assert_not_awaited()
 
 
@@ -13163,6 +13211,35 @@ async def test_new_team_explicit_null_budget_duration_beats_configured_default(
 
     await new_team(
         data=NewTeamRequest(team_alias="lifetime-budget-team", budget_duration=None),
+        http_request=MagicMock(spec=Request),
+        user_api_key_dict=mock_admin_auth,
+    )
+
+    team_data = mock_team_create.call_args.kwargs["data"]
+    assert team_data.get("budget_duration") is None
+    assert team_data.get("budget_reset_at") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", ["", "   "])
+async def test_new_team_blank_budget_duration_is_lifetime_not_a_daily_reset(
+    mock_db_client, mock_admin_auth, monkeypatch, blank
+):
+    """A form-posted empty budget_duration used to stamp budget_reset_at at
+    next midnight. It must persist as unset, the same as an explicit null.
+    """
+    from fastapi import Request
+
+    import litellm
+    from litellm.proxy._types import NewTeamRequest
+    from litellm.proxy.management_endpoints.team_endpoints import new_team
+
+    monkeypatch.setattr(litellm, "default_team_settings", None)
+    monkeypatch.setattr(litellm, "default_team_params", {"budget_duration": "30d"})
+    mock_team_create = _wire_new_team_prisma(mock_db_client)
+
+    await new_team(
+        data=NewTeamRequest(team_alias="blank-duration-team", budget_duration=blank),
         http_request=MagicMock(spec=Request),
         user_api_key_dict=mock_admin_auth,
     )
@@ -13939,6 +14016,52 @@ async def test_team_member_update_skips_invalidation_when_no_budget_fields_sent(
 
     assert await real_cache.async_get_cache(key="team-1_member-1") == "still-fresh-membership"
     assert real_spend_counter_cache.in_memory_cache.get_cache(key="spend:team_member:member-1:team-1") == 1.5
+
+
+@pytest.mark.asyncio
+async def test_evict_created_membership_caches_drops_the_negative_sentinel():
+    """
+    Regression: a membership-create path (/team/member_add, the /team/update budget backfill) must
+    evict any cached "no membership" sentinel a prior session-token read left, so a per-member budget
+    attached at create time is enforced on the next request instead of after the membership cache TTL.
+    Uses a real cache so the assertion is that the sentinel is actually gone, not that a mock was called.
+    """
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        NO_TEAM_MEMBERSHIP_SENTINEL,
+        UserApiKeyCache,
+        team_membership_reservation_cache_key,
+    )
+    from litellm.proxy.management_endpoints.team_endpoints import _evict_created_membership_caches
+
+    cache = UserApiKeyCache()
+    kept_key = team_membership_reservation_cache_key(user_id="carol", team_id="team-eviction")
+    evicted_key = team_membership_reservation_cache_key(user_id="bob", team_id="team-eviction")
+    await cache.async_set_cache(key=kept_key, value=NO_TEAM_MEMBERSHIP_SENTINEL)
+    await cache.async_set_cache(key=evicted_key, value=NO_TEAM_MEMBERSHIP_SENTINEL)
+
+    await _evict_created_membership_caches(user_ids=("bob",), team_id="team-eviction", user_api_key_cache=cache)
+
+    assert await cache.async_get_cache(key=evicted_key) is None
+    assert await cache.async_get_cache(key=kept_key) == NO_TEAM_MEMBERSHIP_SENTINEL
+
+
+def test_member_user_ids_keeps_only_string_user_ids():
+    """
+    The /team/update backfill feeds Prisma-deserialized member dicts here; a row can be missing
+    user_id or carry a non-string value. Only real string ids may reach invalidate_team_member_spend_state,
+    so those get eviction and the malformed rows are dropped rather than crashing the update.
+    """
+    from litellm.proxy.management_endpoints.team_endpoints import _member_user_ids
+
+    members = [
+        {"user_id": "alice", "role": "admin"},
+        {"role": "user"},
+        {"user_id": None, "role": "user"},
+        {"user_id": 123, "role": "user"},
+        {"user_id": "bob", "role": "user"},
+    ]
+
+    assert _member_user_ids(members) == ("alice", "bob")
 
 
 def _team_spend_by_user_team(team_id: str, team_alias: str, member: Member, permissions: list[str]) -> MagicMock:
