@@ -12,8 +12,6 @@ from datetime import datetime, time, timedelta, timezone, tzinfo
 from typing import Final
 from zoneinfo import ZoneInfo
 
-from litellm._logging import verbose_logger
-
 _BUDGET_DURATION_WORD_ALIASES: Final[dict[str, str]] = {
     "hourly": "1h",
     "daily": "24h",
@@ -74,36 +72,29 @@ def duration_in_seconds(duration: str) -> int:
     elif unit == "w":
         return value * 604800
     elif unit == "mo":
-        now: Final = time_module.time()
-        current_time: Final = datetime.fromtimestamp(now)
-
-        # Calculate target month and year, handling overflow past December
-        total_months: Final = current_time.month - 1 + value  # 0-indexed months
-        target_year: Final = current_time.year + total_months // 12
-        target_month: Final = total_months % 12 + 1  # back to 1-indexed
-
-        # Determine the day to set for next month
-        target_day = current_time.day
-        last_day_of_target_month: Final = get_last_day_of_month(target_year, target_month)
-
-        target_day = min(target_day, last_day_of_target_month)
-
-        next_month: Final = datetime(
-            year=target_year,
-            month=target_month,
-            day=target_day,
-            hour=current_time.hour,
-            minute=current_time.minute,
-            second=current_time.second,
-            microsecond=current_time.microsecond,
+        return _months_in_seconds(
+            start=datetime.fromtimestamp(time_module.time(), tz=timezone.utc).astimezone(), months=value
         )
-
-        # Calculate the duration until the first day of the next month
-        duration_until_next_month: Final = next_month - current_time
-        return int(duration_until_next_month.total_seconds())
 
     else:
         raise ValueError(f"Unsupported duration unit, passed duration: {duration}")
+
+
+def duration_in_seconds_from(start: datetime, duration: str) -> int:
+    """How long a period of `duration` lasts when it begins at `start`.
+
+    `duration_in_seconds` measures `Nmo` from now, so a monthly window that opened in a
+    month of a different length needs its own start to know when it ends. Every other
+    unit is a fixed length and ignores `start`.
+    """
+    value, unit = _extract_from_regex(duration=_normalize_duration(duration))
+    if unit == "mo":
+        return _months_in_seconds(start=start, months=value)
+    return duration_in_seconds(duration)
+
+
+def _months_in_seconds(start: datetime, months: int) -> int:
+    return int((_shift_months(start, months) - start).total_seconds())
 
 
 def get_next_standardized_reset_time(
@@ -135,35 +126,63 @@ def get_next_standardized_reset_time(
     # Set up timezone and normalize current time
     current_time, _ = _setup_timezone(current_time, timezone_str)
 
-    # Parse duration
     value, unit = _parse_duration(_normalize_duration(duration))
     if value is None:
-        verbose_logger.warning(
-            "Unrecognized budget_duration %r; falling back to a next-midnight reset. "
-            "Use the <int><unit> format (e.g. '1h', '7d', '30d', '1mo').",
-            duration,
+        raise ValueError(
+            f"Invalid budget_duration {duration!r}. Use the <int><unit> format (e.g. '1h', '7d', '30d', '1mo')."
         )
-        return current_time.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
 
-    # Midnight of the current day in the specified timezone
     base_midnight: Final = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Handle different time units
-    if unit == "d":
-        return _handle_day_reset(current_time, base_midnight, value, reset_time_of_day)
-    elif unit == "w":
-        return _handle_day_reset(current_time, base_midnight, value * 7, reset_time_of_day)
-    elif unit == "h":
-        return _handle_hour_reset(current_time, base_midnight, value)
-    elif unit == "m":
-        return _handle_minute_reset(current_time, base_midnight, value)
-    elif unit == "s":
-        return _handle_second_reset(current_time, base_midnight, value)
-    elif unit == "mo":
-        return _handle_month_reset(current_time, base_midnight, value, reset_time_of_day)
-    else:
-        # Unrecognized unit, default to next midnight
-        return base_midnight + timedelta(days=1)
+    match unit:
+        case "d":
+            return _handle_day_reset(current_time, base_midnight, value, reset_time_of_day)
+        case "w":
+            return _handle_day_reset(current_time, base_midnight, value * 7, reset_time_of_day)
+        case "h":
+            return _handle_hour_reset(current_time, base_midnight, value)
+        case "m":
+            return _handle_minute_reset(current_time, base_midnight, value)
+        case "s":
+            return _handle_second_reset(current_time, base_midnight, value)
+        case "mo":
+            return _handle_month_reset(current_time, base_midnight, value, reset_time_of_day)
+        case _:
+            raise ValueError(
+                f"Invalid budget_duration {duration!r}. Use the <int><unit> format (e.g. '1h', '7d', '30d', '1mo')."
+            )
+
+
+def _shift_months(moment: datetime, months: int) -> datetime:
+    """`moment` moved by `months` calendar months, back when negative, clamped to the target month's last day."""
+    total_months: Final = moment.year * 12 + moment.month - 1 + months
+    year, month_index = divmod(total_months, 12)
+    month: Final = month_index + 1
+    return moment.replace(year=year, month=month, day=min(moment.day, get_last_day_of_month(year, month)))
+
+
+def get_budget_window_start(duration: str, reset_at: datetime) -> datetime:
+    """Start of the budget period that ends at `reset_at`, under the same rules
+    `get_next_standardized_reset_time` used to pick it: `30d` and `Nmo` span calendar
+    months and a duration it does not recognize resets at the next midnight."""
+    value, unit = _parse_duration(_normalize_duration(duration))
+    if value is None:
+        return reset_at - timedelta(days=1)
+    match unit:
+        case "mo":
+            return _shift_months(reset_at, -value)
+        case "d":
+            return _shift_months(reset_at, -1) if value == 30 else reset_at - timedelta(days=value)
+        case "w":
+            return reset_at - timedelta(weeks=value)
+        case "h":
+            return reset_at - timedelta(hours=value)
+        case "m":
+            return reset_at - timedelta(minutes=value)
+        case "s":
+            return reset_at - timedelta(seconds=value)
+        case _:
+            return reset_at - timedelta(days=1)
 
 
 def _setup_timezone(current_time: datetime, timezone_str: str = "UTC") -> tuple[datetime, tzinfo]:
